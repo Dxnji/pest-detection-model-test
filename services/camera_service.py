@@ -5,10 +5,12 @@ Responsibilities:
 - Provide a low-latency capture loop that always exposes the latest frame
 - Lightweight test mode for health checks and optional debug frame saving
 - Graceful shutdown, reconnect logic, and safety protections
+- Camera version checking and hardware diagnostics
 
 Design notes:
 - A single-frame slot (latest frame) is used to avoid queue buildup and copies.
 - A short-grace reconnect loop prevents dead capture streams from stalling.
+- Pre-flight diagnostics check OpenCV version, camera availability, and capabilities.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 from pathlib import Path
 
@@ -56,6 +58,90 @@ class CameraConfig:
             raise ValueError(f"Camera read_timeout must be positive, got {self.read_timeout}")
 
 
+class CameraVersion:
+    """OpenCV version info and camera capability checks."""
+    
+    @staticmethod
+    def get_opencv_version() -> str:
+        """Return OpenCV version string."""
+        return cv2.__version__
+    
+    @staticmethod
+    def get_opencv_major_minor() -> Tuple[int, int]:
+        """Return major and minor version as tuple."""
+        parts = cv2.__version__.split('.')
+        major = int(parts[0]) if len(parts) > 0 else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        return (major, minor)
+    
+    @staticmethod
+    def check_v4l2_support() -> bool:
+        """Check if VideoCapture uses v4l2 backend (Linux/RPi)."""
+        try:
+            cap = cv2.VideoCapture(0)
+            backend = cap.get(cv2.CAP_PROP_BACKEND)
+            cap.release()
+            # CAP_V4L2 = 200
+            return backend == 200
+        except Exception:
+            return False
+    
+    @staticmethod
+    def get_camera_properties(device: int = 0) -> Dict[str, Any]:
+        """Probe camera device for supported properties."""
+        props = {
+            "device": device,
+            "is_available": False,
+            "frame_count": 0,
+            "fps": 0.0,
+            "width": 0,
+            "height": 0,
+            "backend": "unknown",
+            "can_set_fps": False,
+            "can_set_resolution": False,
+            "first_frame_time_ms": None,
+            "error": None,
+        }
+        
+        try:
+            cap = cv2.VideoCapture(device)
+            if not cap.isOpened():
+                props["error"] = "Failed to open VideoCapture"
+                return props
+            
+            props["is_available"] = True
+            props["frame_count"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            props["fps"] = cap.get(cv2.CAP_PROP_FPS)
+            props["width"] = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            props["height"] = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            props["backend"] = int(cap.get(cv2.CAP_PROP_BACKEND))
+            
+            # Test setting FPS
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            props["can_set_fps"] = cap.get(cv2.CAP_PROP_FPS) > 0
+            
+            # Test setting resolution
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            props["can_set_resolution"] = (w > 0 and h > 0)
+            
+            # Measure first frame latency
+            t0 = time.time()
+            for _ in range(10):
+                ok, frame = cap.read()
+                if ok:
+                    props["first_frame_time_ms"] = (time.time() - t0) * 1000
+                    break
+            
+            cap.release()
+        except Exception as exc:
+            props["error"] = str(exc)
+        
+        return props
+
+
 class CameraService:
     """Camera service providing a low-latency newest-frame buffer.
 
@@ -64,6 +150,10 @@ class CameraService:
     - call `start()` to begin capture thread
     - use `get_latest(copy=False)` to obtain newest frame reference
     - call `stop()` to shutdown and release resources
+    
+    For troubleshooting, call:
+    - `diagnose()` to check OpenCV version and camera hardware
+    - `benchmark_first_frame()` to measure actual startup latency
     """
 
     def __init__(self, config: Optional[CameraConfig] = None):
@@ -77,6 +167,101 @@ class CameraService:
         self._latest_ts: Optional[float] = None
         self._latest_frame_id: int = 0
         self._opened = False
+        self._first_frame_timestamp: Optional[float] = None
+
+    def diagnose(self) -> Dict[str, Any]:
+        """Run comprehensive diagnostics on camera and OpenCV setup.
+        
+        Returns a dict with:
+        - opencv_version: OpenCV version string
+        - camera_available: bool
+        - camera_properties: dict of hardware capabilities
+        - first_frame_latency_ms: measured startup time
+        - recommendations: list of improvement suggestions
+        """
+        logger.info("=== CAMERA DIAGNOSTIC REPORT ===")
+        
+        report = {
+            "opencv_version": CameraVersion.get_opencv_version(),
+            "opencv_major_minor": CameraVersion.get_opencv_major_minor(),
+            "v4l2_backend": CameraVersion.check_v4l2_support(),
+            "camera_device": self.config.device,
+            "camera_properties": CameraVersion.get_camera_properties(self.config.device),
+            "first_frame_latency_ms": None,
+            "recommendations": [],
+        }
+        
+        logger.info(f"OpenCV Version: {report['opencv_version']}")
+        logger.info(f"Camera Device: /dev/video{self.config.device}")
+        logger.info(f"Using v4l2 backend: {report['v4l2_backend']}")
+        
+        props = report["camera_properties"]
+        if props.get("error"):
+            logger.error(f"Camera Error: {props['error']}")
+            report["recommendations"].append(
+                f"Camera device /dev/video{self.config.device} failed to open: {props['error']}"
+            )
+        else:
+            logger.info(f"Camera FPS: {props.get('fps', 'unknown')}")
+            logger.info(f"Camera Resolution: {props.get('width')}x{props.get('height')}")
+            logger.info(f"First Frame Latency: {props.get('first_frame_time_ms'):.1f}ms")
+            report["first_frame_latency_ms"] = props.get("first_frame_time_ms")
+            
+            if not props.get("can_set_fps"):
+                report["recommendations"].append(
+                    "Camera driver may not support FPS configuration; performance may vary"
+                )
+            if not props.get("can_set_resolution"):
+                report["recommendations"].append(
+                    "Camera driver may not support resolution changes; using driver defaults"
+                )
+            
+            if props.get("first_frame_time_ms", 999) > 2000:
+                report["recommendations"].append(
+                    f"High first-frame latency ({props.get('first_frame_time_ms'):.0f}ms); "
+                    "consider lower resolution or reducing FPS"
+                )
+        
+        for rec in report["recommendations"]:
+            logger.warning(f"  * {rec}")
+        
+        logger.info("=== END DIAGNOSTIC REPORT ===\n")
+        return report
+
+    def benchmark_first_frame(self, trials: int = 3) -> float:
+        """Measure actual time to get first frame (useful for tuning timeout).
+        
+        Runs multiple trials and returns the median latency in seconds.
+        """
+        logger.info(f"Benchmarking first-frame latency ({trials} trials)...")
+        latencies = []
+        
+        for trial in range(trials):
+            try:
+                self.stop()  # ensure clean state
+                time.sleep(0.2)
+                
+                t0 = time.time()
+                self.start()
+                got_frame = self.wait_for_first_frame(timeout=10.0)
+                elapsed = time.time() - t0
+                
+                if got_frame:
+                    latencies.append(elapsed)
+                    logger.info(f"  Trial {trial + 1}: {elapsed:.2f}s")
+                else:
+                    logger.warning(f"  Trial {trial + 1}: timeout after {elapsed:.2f}s")
+            except Exception as exc:
+                logger.exception(f"  Trial {trial + 1}: exception {exc}")
+        
+        if latencies:
+            latencies.sort()
+            median = latencies[len(latencies) // 2]
+            logger.info(f"Median latency: {median:.2f}s; recommend timeout >= {median * 1.5:.2f}s")
+            return median
+        else:
+            logger.error("All trials failed; cannot determine latency")
+            return 999.0
 
     def _open_capture(self) -> bool:
         logger.info(f"Opening camera device {self.config.device}")
@@ -121,6 +306,9 @@ class CameraService:
     def _capture_loop(self) -> None:
         backoff = 0.5
         last_open_attempt = 0.0
+        frames_captured = 0
+        loop_start_time = time.time()
+        
         while not self._stop_event.is_set():
             with self._capture_lock:
                 cap = self._capture
@@ -137,6 +325,8 @@ class CameraService:
                     backoff = min(5.0, backoff * 1.5)
                     continue
                 backoff = 0.5
+                frames_captured = 0
+                loop_start_time = time.time()
                 with self._capture_lock:
                     cap = self._capture
             if cap is None:
@@ -161,6 +351,13 @@ class CameraService:
                     self._latest_frame = frame
                     self._latest_ts = time.time()
                     self._latest_frame_id += 1
+                    
+                    # Track first frame timestamp for diagnostics
+                    if self._first_frame_timestamp is None:
+                        self._first_frame_timestamp = time.time() - loop_start_time
+                        logger.info(f"First frame captured in {self._first_frame_timestamp*1000:.1f}ms")
+                
+                frames_captured += 1
 
             except Exception as exc:  # defensive: do not let thread die
                 logger.exception("Camera capture loop exception: %s", exc)
@@ -182,7 +379,7 @@ class CameraService:
                 except Exception:
                     pass
                 self._capture = None
-        logger.info("Camera capture thread stopped")
+        logger.info(f"Camera capture thread stopped (captured {frames_captured} frames)")
 
     def is_available(self) -> bool:
         # quick non-blocking probe: try to open and read a single frame
@@ -213,13 +410,53 @@ class CameraService:
             return time.time() - self._latest_ts
 
     def wait_for_first_frame(self, timeout: float = 5.0) -> bool:
+        """Wait for the first frame with diagnostic logging.
+        
+        Args:
+            timeout: Maximum seconds to wait for first frame
+            
+        Returns:
+            True if first frame received, False if timeout or stopped
+        """
+        logger.info(f"Waiting for first frame (timeout={timeout:.1f}s)...")
         start = time.time()
+        last_log = start
+        log_interval = 1.0
+        
         while time.time() - start < timeout:
             if self.get_latest(copy=False) is not None:
+                elapsed = time.time() - start
+                logger.info(f"First frame received in {elapsed:.2f}s")
                 return True
+            
             if self._stop_event.is_set():
+                logger.warning("wait_for_first_frame: stop event set, aborting")
                 return False
+            
+            # Log progress every second
+            now = time.time()
+            if now - last_log >= log_interval:
+                elapsed_so_far = now - start
+                logger.debug(f"Waiting... {elapsed_so_far:.1f}s elapsed (thread alive: {self._thread and self._thread.is_alive()})")
+                last_log = now
+            
             time.sleep(0.05)
+        
+        # Timeout occurred
+        elapsed = time.time() - start
+        logger.error(f"Timeout waiting for first frame after {elapsed:.2f}s")
+        
+        # Log diagnostic info
+        if self._thread is None or not self._thread.is_alive():
+            logger.error("  -> Camera thread is NOT running")
+        else:
+            logger.error("  -> Camera thread is running but no frames received")
+            with self._capture_lock:
+                if self._capture is None:
+                    logger.error("     VideoCapture is None")
+                elif not self._opened:
+                    logger.error("     VideoCapture not opened")
+        
         return False
 
     def get_latest(self, copy: bool = False) -> Optional[Tuple[np.ndarray, float]]:
